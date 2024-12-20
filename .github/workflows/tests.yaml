@@ -1,0 +1,21 @@
+name: tests
+on: [push, pull_request]
+
+jobs:
+  testing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v1
+      - name: Setup Environment (Using NodeJS 22.x)
+        uses: actions/setup-node@v1
+        with:
+          node-version: 22.x
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Linting
+        run: npm run format
+
+      - name: Run tests
+        run: npm run test
