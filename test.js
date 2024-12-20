@@ -110,8 +110,8 @@ test('idempotencyMiddleware - idempotency key present and cache hit', async (t) 
   )
   assert.strictEqual(
     res.statusCode,
-    304,
-    'Should return 304 Not Modified if cache hit',
+    204,
+    'Should return 204 Not Modified if cache hit',
   )
   assert.strictEqual(
     res.headers['content-type'],

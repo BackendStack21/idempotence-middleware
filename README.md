@@ -63,7 +63,7 @@ Calling the API
 
 ```bash
 curl -X POST http://localhost:3000/create -H "x-request-id: 123"  # 200 -> Resource created!
-curl -X POST http://localhost:3000/create -H "x-request-id: 123"  # 304
+curl -X POST http://localhost:3000/create -H "x-request-id: 123"  # 204
 # after 5 seconds
 curl -X POST http://localhost:3000/create -H "x-request-id: 123"  # 200 -> Resource created!
 ```

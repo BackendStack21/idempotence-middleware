@@ -66,8 +66,8 @@ export function idempotencyMiddleware({
         .get(idempotencyKey)
         .then(function (cachedResponse) {
           if (cachedResponse) {
-            // Cached response found: return 304 Not Modified to prevent reprocessing
-            res.statusCode = 304
+            res.statusCode = 204
+            res.setHeader('X-Idempotency-Status', 'hit')
             res.setHeader('Content-Type', 'text/plain; charset=utf-8')
             res.end()
           } else {
