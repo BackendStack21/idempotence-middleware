@@ -1,6 +1,7 @@
 {
   "name": "idempotency-middleware",
   "description": "Idempotency middleware for connect-like frameworks such as Express and Restana",
+  "version": "1.0.0",
   "module": "index.js",
   "types": "index.d.ts",
   "type": "module",
