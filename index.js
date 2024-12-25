@@ -69,7 +69,7 @@ export function idempotencyMiddleware({
             res.statusCode = 204
             res.setHeader('X-Idempotency-Status', 'hit')
             res.setHeader('Content-Type', 'text/plain; charset=utf-8')
-            res.end()
+            res.end('') // Ensuring protocol consistency
           } else {
             // No cached response found: set up a post-response hook
             onEnd(res, function (payload) {
