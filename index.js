@@ -205,8 +205,8 @@ function isValidIdempotencyKey(key) {
 }
 
 function buildCacheKey(prefix, req, idempotencyKey) {
-  const method = req.method || ''
-  const url = req.url || req.originalUrl || ''
+  const method = req.method
+  const url = req.url || req.originalUrl
   const keyMaterial = `${method}:${url}:${idempotencyKey}`
   return `${prefix}${hashSha256(keyMaterial)}`
 }
