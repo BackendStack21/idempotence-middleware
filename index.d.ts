@@ -59,6 +59,7 @@ export interface IdempotencyMiddlewareOptions {
 
   /**
    * Default time-to-live for cached responses, in milliseconds.
+   * Must be between 1 and 86,400,000 (24 hours).
    */
   ttl: number
 
@@ -66,10 +67,14 @@ export interface IdempotencyMiddlewareOptions {
    * A function to extract the idempotency key from the HTTP request.
    * Defaults to extracting the `x-request-id` header.
    *
+   * The returned key must be a non-empty string of at most 128 characters
+   * matching `^[a-zA-Z0-9_.~-]+$`. In multi-user environments the key should
+   * be scoped with a user/tenant identifier to prevent cross-user collisions.
+   *
    * @param req - The incoming HTTP request.
-   * @returns The extracted idempotency key as a string.
+   * @returns The extracted idempotency key, or `undefined`/`null` to disable idempotency.
    */
-  idempotencyKeyExtractor?: (req: IncomingMessage) => string
+  idempotencyKeyExtractor?: (req: IncomingMessage) => string | undefined | null
 
   /**
    * An optional logger for error reporting.
@@ -80,9 +85,16 @@ export interface IdempotencyMiddlewareOptions {
 
   /**
    * A prefix to prepend to cache keys to avoid collisions with other cached data.
-   * Defaults to `'idempotent-req-'`.
+   * Defaults to `'idemp-key-'`.
    */
   keyPrefix?: string
+
+  /**
+   * Maximum response body size (in bytes) that will be cached.
+   * Responses larger than this value are not cached, preventing cache memory exhaustion.
+   * Defaults to 1 MB (1,048,576 bytes).
+   */
+  maxResponseSize?: number
 }
 
 /**
@@ -90,15 +102,19 @@ export interface IdempotencyMiddlewareOptions {
  *
  * The middleware ensures idempotent handling of requests by:
  * - Checking if a response for a unique request key (idempotency key) is cached.
- * - Returning a cached response if available, skipping reprocessing.
+ * - Returning the cached response if available, skipping reprocessing.
  * - Caching successful responses (status codes 2xx) for future requests.
+ *
+ * The cache key is scoped by HTTP method, request URL, and the extracted idempotency
+ * key, and the middleware uses an in-flight lock to prevent concurrent duplicate
+ * processing of the same key.
  *
  * @param options - Configuration options for the middleware.
  * @returns A middleware function compatible with Connect-like frameworks.
  */
 export function idempotencyMiddleware(
   options: IdempotencyMiddlewareOptions,
-): (req: IncomingMessage, res: ServerResponse, next: () => void) => void
+): (req: IncomingMessage, res: ServerResponse, next: (err?: any) => void) => void
 
 /**
  * Generates a SHA-256 hash of the input string.
