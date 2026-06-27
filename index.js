@@ -3,6 +3,26 @@
 import crypto from 'crypto'
 import onEnd from 'on-http-end'
 
+const DEFAULT_KEY_PREFIX = 'idemp-key-'
+const MAX_KEY_LENGTH = 128
+const SAFE_KEY_PATTERN = /^[a-zA-Z0-9_.~-]+$/
+const MAX_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
+const DEFAULT_MAX_RESPONSE_SIZE = 1024 * 1024 // 1 MB
+const DEFAULT_CACHE_TIMEOUT = 5000 // 5 seconds
+
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'content-length',
+  'date',
+])
+
 /**
  * Creates a middleware function that implements idempotency based on a request-specific key
  * (commonly referred to as an 'idempotency key' or 'request id').
@@ -13,19 +33,25 @@ import onEnd from 'on-http-end'
  *
  * @param {Object} options - Configuration options for the middleware.
  * @param {Object} options.cache - A cache instance that supports `.get(key)` and `.set(key, value, { ttl })` methods.
- * @param {number} options.ttl - Time-to-live in milliseconds for cached responses.
+ * @param {number} options.ttl - Time-to-live in milliseconds for cached responses (1..86400000).
  * @param {string} [options.idempotencyKeyExtractor] - A function that extracts the idempotency key from the request object.
  * @param {Object} [options.logger=console] - A logger object with `.error()` and possibly other methods for logging.
+ * @param {string} [options.keyPrefix='idemp-key-'] - Prefix prepended to cache keys.
+ * @param {number} [options.maxResponseSize=1048576] - Maximum response body size (in bytes) that will be cached.
+ * @param {number} [options.cacheTimeout=5000] - Maximum time (in milliseconds) to wait for cache.get() before timing out.
  *
  * @returns {Function} Connect-style middleware function `(req, res, next)`.
  *
- * @throws {Error} If `cache` or `ttl` is not provided.
+ * @throws {Error} If `cache` or `ttl` is not provided, or if options are invalid.
  */
 export function idempotencyMiddleware({
   cache,
   ttl,
   idempotencyKeyExtractor = (req) => req.headers['x-request-id'],
   logger = console,
+  keyPrefix = DEFAULT_KEY_PREFIX,
+  maxResponseSize = DEFAULT_MAX_RESPONSE_SIZE,
+  cacheTimeout = DEFAULT_CACHE_TIMEOUT,
 }) {
   // Validate the mandatory parameters
   if (
@@ -38,75 +64,277 @@ export function idempotencyMiddleware({
     )
   }
 
-  if (typeof ttl !== 'number' || ttl <= 0) {
+  if (typeof ttl !== 'number' || !Number.isFinite(ttl) || ttl <= 0) {
     throw new Error(
       'IdempotencyMiddleware: A positive numeric ttl (in milliseconds) is required.',
     )
   }
 
-  return function (req, res, next) {
-    if (
-      req.method === 'POST' ||
-      req.method === 'PUT' ||
-      req.method === 'PATCH' ||
-      req.method === 'DELETE'
-    ) {
-      let idempotencyKey = idempotencyKeyExtractor(req)
+  if (ttl > MAX_TTL_MS) {
+    throw new Error(
+      `IdempotencyMiddleware: ttl must be between 1 and ${MAX_TTL_MS} milliseconds.`,
+    )
+  }
 
-      // If no idempotency key is found, there's no special handling needed
-      if (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0) {
+  if (typeof keyPrefix !== 'string' || keyPrefix.length === 0) {
+    throw new Error(
+      'IdempotencyMiddleware: keyPrefix must be a non-empty string.',
+    )
+  }
+
+  if (
+    typeof maxResponseSize !== 'number' ||
+    !Number.isFinite(maxResponseSize) ||
+    maxResponseSize <= 0
+  ) {
+    throw new Error(
+      'IdempotencyMiddleware: maxResponseSize must be a positive number.',
+    )
+  }
+
+  if (
+    typeof cacheTimeout !== 'number' ||
+    !Number.isFinite(cacheTimeout) ||
+    cacheTimeout <= 0
+  ) {
+    throw new Error(
+      'IdempotencyMiddleware: cacheTimeout must be a positive number.',
+    )
+  }
+
+  // In-flight request locks per cache key. This prevents two requests with the same
+  // idempotency key from both missing the cache and executing the handler.
+  const inFlight = new Map()
+
+  return async function (req, res, next) {
+    try {
+      if (
+        req.method !== 'POST' &&
+        req.method !== 'PUT' &&
+        req.method !== 'PATCH' &&
+        req.method !== 'DELETE'
+      ) {
         return next()
       }
 
-      // Hash the idempotency key to ensure it's a valid cache key
-      idempotencyKey = 'idemp-key-' + hashSha256(idempotencyKey)
+      let idempotencyKey
+      try {
+        idempotencyKey = idempotencyKeyExtractor(req)
+      } catch (err) {
+        logger.error('IdempotencyMiddleware - Extractor Error:', err)
+        return next()
+      }
 
-      // Attempt to retrieve a cached response
-      cache
-        .get(idempotencyKey)
-        .then(function (cachedResponse) {
-          if (cachedResponse) {
-            res.statusCode = 204
-            res.setHeader('X-Idempotency-Status', 'hit')
-            res.setHeader('Content-Type', 'text/plain; charset=utf-8')
-            res.end('') // Ensuring protocol consistency
-          } else {
-            // No cached response found: set up a post-response hook
-            onEnd(res, function (payload) {
-              // Only cache the response if it's a success (2xx)
-              if (
-                payload.status >= 200 &&
-                payload.status < 300 &&
-                typeof idempotencyKey === 'string'
-              ) {
-                // Store a simple flag or a derived response as needed.
-                // Here we store `true` to indicate a successful processed request.
-                // If you need to store the actual payload, store `payload.body` instead.
-                cache
-                  .set(idempotencyKey, '1', {ttl: ttl})
-                  .catch(function (err) {
-                    logger.error(
-                      'IdempotencyMiddleware - Cache WRITE Error:',
-                      err,
-                    )
-                  })
+      if (!isValidIdempotencyKey(idempotencyKey)) {
+        return next()
+      }
+
+      const cacheKey = buildCacheKey(keyPrefix, req, idempotencyKey)
+
+      // Wait for any in-flight request for the same key to finish, then acquire the
+      // lock before any async cache read so concurrent requests cannot race past
+      // this point and both execute the handler.
+      let existing = inFlight.get(cacheKey)
+      while (existing) {
+        await existing
+        existing = inFlight.get(cacheKey)
+      }
+
+      const {promise: lock, release} = createLock()
+      inFlight.set(cacheKey, lock)
+
+      const onClose = () => release()
+      res.once('close', onClose)
+
+      try {
+        // Double-check the cache now that we hold the lock.
+        const cachedResponse = await withTimeout(
+          cache.get(cacheKey),
+          cacheTimeout,
+        )
+        if (isValidCachedResponse(cachedResponse)) {
+          replayResponse(res, cachedResponse)
+          res.removeListener('close', onClose)
+          release()
+          inFlight.delete(cacheKey)
+          return
+        }
+
+        // No cached response found: set up a post-response hook.
+        onEnd(res, function (payload) {
+          try {
+            // Only cache the response if it's a success (2xx) and not too large.
+            if (
+              payload.status >= 200 &&
+              payload.status < 300 &&
+              typeof cacheKey === 'string' &&
+              getBodyLength(payload.data) <= maxResponseSize
+            ) {
+              const responseToCache = {
+                version: 1,
+                status: payload.status,
+                headers: payload.headers,
+                body: serializeBody(payload.data),
+                cachedAt: Date.now(),
               }
-            })
-
-            // Proceed to the next handler in the chain
-            next()
+              cache
+                .set(cacheKey, responseToCache, {ttl: ttl})
+                .catch(function (err) {
+                  logger.error(
+                    'IdempotencyMiddleware - Cache WRITE Error:',
+                    err,
+                  )
+                })
+            }
+          } finally {
+            res.removeListener('close', onClose)
+            release()
+            inFlight.delete(cacheKey)
           }
         })
-        .catch(function (error) {
-          // If there's an error reading from the cache, log and proceed without caching
-          logger.error('IdempotencyMiddleware - Cache READ Error:', error)
-          next()
-        })
-    } else {
-      // For non-idempotent methods, proceed without special handling
-      next()
+
+        // Proceed to the next handler in the chain
+        next()
+      } catch (error) {
+        res.removeListener('close', onClose)
+        release()
+        inFlight.delete(cacheKey)
+        if (
+          error.message ===
+          'IdempotencyMiddleware - Response headers already sent'
+        ) {
+          return next(error)
+        }
+        logger.error('IdempotencyMiddleware - Cache READ Error:', error)
+        return next()
+      }
+    } catch (error) {
+      logger.error('IdempotencyMiddleware - Unexpected Error:', error)
+      return next(error)
     }
   }
+}
+
+function createLock() {
+  let release
+  let released = false
+  const promise = new Promise((resolve) => {
+    release = () => {
+      if (released) return
+      released = true
+      resolve()
+    }
+  })
+  return {promise, release}
+}
+
+function isValidIdempotencyKey(key) {
+  return (
+    typeof key === 'string' &&
+    key.length > 0 &&
+    key.length <= MAX_KEY_LENGTH &&
+    SAFE_KEY_PATTERN.test(key)
+  )
+}
+
+function buildCacheKey(prefix, req, idempotencyKey) {
+  const method = req.method
+  const url = req.url || req.originalUrl
+  const keyMaterial = `${method}:${url}:${idempotencyKey}`
+  return `${prefix}${hashSha256(keyMaterial)}`
+}
+
+function isValidCachedResponse(value) {
+  return (
+    value &&
+    typeof value === 'object' &&
+    value.version === 1 &&
+    typeof value.status === 'number' &&
+    value.status >= 200 &&
+    value.status < 300 &&
+    typeof value.cachedAt === 'number' &&
+    value.body !== undefined &&
+    value.body !== null
+  )
+}
+
+function replayResponse(res, cachedResponse) {
+  if (res.headersSent) {
+    throw new Error('IdempotencyMiddleware - Response headers already sent')
+  }
+
+  res.statusCode = cachedResponse.status
+  res.setHeader('X-Idempotency-Status', 'hit')
+
+  const headers = cachedResponse.headers || {}
+  for (const [name, value] of Object.entries(headers)) {
+    if (HOP_BY_HOP_HEADERS.has(name.toLowerCase())) {
+      continue
+    }
+    res.setHeader(name, value)
+  }
+
+  res.end(deserializeBody(cachedResponse.body))
+}
+
+function serializeBody(body) {
+  if (Buffer.isBuffer(body)) {
+    return {type: 'buffer', data: body.toString('base64')}
+  }
+  return {type: 'string', data: String(body ?? '')}
+}
+
+function deserializeBody(body) {
+  if (body && typeof body === 'object') {
+    if (body.type === 'buffer' && typeof body.data === 'string') {
+      return Buffer.from(body.data, 'base64')
+    }
+    if (body.type === 'string') {
+      return body.data
+    }
+  }
+  return body
+}
+
+function getBodyLength(body) {
+  if (body === undefined || body === null) {
+    return 0
+  }
+  if (Buffer.isBuffer(body)) {
+    return body.length
+  }
+  if (typeof body === 'string') {
+    return Buffer.byteLength(body, 'utf8')
+  }
+  return Infinity
+}
+
+/**
+ * Wraps a promise so that it rejects if it does not settle within the given timeout.
+ *
+ * @template T
+ * @param {Promise<T>} promise - The promise to wrap.
+ * @param {number} ms - The timeout in milliseconds.
+ *
+ * @returns {Promise<T>} A promise that resolves or rejects with the original promise, or rejects on timeout.
+ */
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('IdempotencyMiddleware - Cache READ Timeout'))
+    }, ms)
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
 }
 
 /**

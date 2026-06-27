@@ -6,6 +6,12 @@ const {CacheableMemory} = require('cacheable')
 
 const SERVICE_NAME = 'express-demo'
 
+function getCurrentUserId(req) {
+  // Replace this with the real authenticated user identifier.
+  // In Express you typically read it from req.user after authentication.
+  return req.user?.id ?? 'anonymous'
+}
+
 const cache = createCache({
   stores: [
     new Keyv({
@@ -15,13 +21,22 @@ const cache = createCache({
   ],
 })
 
+function extractIdempotencyKey(req) {
+  const header = req.headers['x-custom-req-id']
+  const value = Array.isArray(header) ? header[0] : header
+  if (!value || !/^[a-zA-Z0-9_.~-]{1,128}$/.test(value)) {
+    return undefined
+  }
+  // Scope the key with a service and user identifier to prevent cross-user collisions.
+  return `${SERVICE_NAME}-${getCurrentUserId(req)}-${value}`
+}
+
 const app = express()
 
 app.use(
   idempotencyMiddleware({
     ttl: 5000,
-    idempotencyKeyExtractor: (req) =>
-      `${SERVICE_NAME}-${req.headers['x-custom-req-id']}`,
+    idempotencyKeyExtractor: extractIdempotencyKey,
     cache: {
       get: async (key) => {
         return cache.get(key)
