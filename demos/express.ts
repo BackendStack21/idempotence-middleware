@@ -5,7 +5,12 @@ import Keyv from 'keyv'
 import {CacheableMemory} from 'cacheable'
 
 const SERVICE_NAME = 'express-demo'
-const USER_ID = 'user-42'
+
+function getCurrentUserId(req: Request): string {
+  // Replace this with the real authenticated user identifier.
+  // In Express you typically read it from req.user after authentication.
+  return (req as Request & {user?: {id: string}}).user?.id ?? 'anonymous'
+}
 
 const cache = createCache({
   stores: [
@@ -23,7 +28,7 @@ function extractIdempotencyKey(req: Request): string | undefined {
     return undefined
   }
   // Scope the key with a service and user identifier to prevent cross-user collisions.
-  return `${SERVICE_NAME}-${USER_ID}-${value}`
+  return `${SERVICE_NAME}-${getCurrentUserId(req)}-${value}`
 }
 
 const app = express()

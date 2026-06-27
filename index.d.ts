@@ -95,6 +95,12 @@ export interface IdempotencyMiddlewareOptions {
    * Defaults to 1 MB (1,048,576 bytes).
    */
   maxResponseSize?: number
+
+  /**
+   * Maximum time (in milliseconds) to wait for a cache read before giving up and
+   * calling the next handler. Defaults to 5,000 ms.
+   */
+  cacheTimeout?: number
 }
 
 /**
@@ -114,7 +120,11 @@ export interface IdempotencyMiddlewareOptions {
  */
 export function idempotencyMiddleware(
   options: IdempotencyMiddlewareOptions,
-): (req: IncomingMessage, res: ServerResponse, next: (err?: any) => void) => void
+): (
+  req: IncomingMessage,
+  res: ServerResponse,
+  next: (err?: any) => void,
+) => void
 
 /**
  * Generates a SHA-256 hash of the input string.

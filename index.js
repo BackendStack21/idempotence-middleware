@@ -8,6 +8,7 @@ const MAX_KEY_LENGTH = 128
 const SAFE_KEY_PATTERN = /^[a-zA-Z0-9_.~-]+$/
 const MAX_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
 const DEFAULT_MAX_RESPONSE_SIZE = 1024 * 1024 // 1 MB
+const DEFAULT_CACHE_TIMEOUT = 5000 // 5 seconds
 
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
@@ -37,6 +38,7 @@ const HOP_BY_HOP_HEADERS = new Set([
  * @param {Object} [options.logger=console] - A logger object with `.error()` and possibly other methods for logging.
  * @param {string} [options.keyPrefix='idemp-key-'] - Prefix prepended to cache keys.
  * @param {number} [options.maxResponseSize=1048576] - Maximum response body size (in bytes) that will be cached.
+ * @param {number} [options.cacheTimeout=5000] - Maximum time (in milliseconds) to wait for cache.get() before timing out.
  *
  * @returns {Function} Connect-style middleware function `(req, res, next)`.
  *
@@ -49,6 +51,7 @@ export function idempotencyMiddleware({
   logger = console,
   keyPrefix = DEFAULT_KEY_PREFIX,
   maxResponseSize = DEFAULT_MAX_RESPONSE_SIZE,
+  cacheTimeout = DEFAULT_CACHE_TIMEOUT,
 }) {
   // Validate the mandatory parameters
   if (
@@ -86,6 +89,16 @@ export function idempotencyMiddleware({
   ) {
     throw new Error(
       'IdempotencyMiddleware: maxResponseSize must be a positive number.',
+    )
+  }
+
+  if (
+    typeof cacheTimeout !== 'number' ||
+    !Number.isFinite(cacheTimeout) ||
+    cacheTimeout <= 0
+  ) {
+    throw new Error(
+      'IdempotencyMiddleware: cacheTimeout must be a positive number.',
     )
   }
 
@@ -130,11 +143,18 @@ export function idempotencyMiddleware({
       const {promise: lock, release} = createLock()
       inFlight.set(cacheKey, lock)
 
+      const onClose = () => release()
+      res.once('close', onClose)
+
       try {
         // Double-check the cache now that we hold the lock.
-        const cachedResponse = await cache.get(cacheKey)
+        const cachedResponse = await withTimeout(
+          cache.get(cacheKey),
+          cacheTimeout,
+        )
         if (isValidCachedResponse(cachedResponse)) {
           replayResponse(res, cachedResponse)
+          res.removeListener('close', onClose)
           release()
           inFlight.delete(cacheKey)
           return
@@ -167,6 +187,7 @@ export function idempotencyMiddleware({
                 })
             }
           } finally {
+            res.removeListener('close', onClose)
             release()
             inFlight.delete(cacheKey)
           }
@@ -175,8 +196,15 @@ export function idempotencyMiddleware({
         // Proceed to the next handler in the chain
         next()
       } catch (error) {
+        res.removeListener('close', onClose)
         release()
         inFlight.delete(cacheKey)
+        if (
+          error.message ===
+          'IdempotencyMiddleware - Response headers already sent'
+        ) {
+          return next(error)
+        }
         logger.error('IdempotencyMiddleware - Cache READ Error:', error)
         return next()
       }
@@ -189,8 +217,13 @@ export function idempotencyMiddleware({
 
 function createLock() {
   let release
+  let released = false
   const promise = new Promise((resolve) => {
-    release = resolve
+    release = () => {
+      if (released) return
+      released = true
+      resolve()
+    }
   })
   return {promise, release}
 }
@@ -226,6 +259,10 @@ function isValidCachedResponse(value) {
 }
 
 function replayResponse(res, cachedResponse) {
+  if (res.headersSent) {
+    throw new Error('IdempotencyMiddleware - Response headers already sent')
+  }
+
   res.statusCode = cachedResponse.status
   res.setHeader('X-Idempotency-Status', 'hit')
 
@@ -260,13 +297,44 @@ function deserializeBody(body) {
 }
 
 function getBodyLength(body) {
+  if (body === undefined || body === null) {
+    return 0
+  }
   if (Buffer.isBuffer(body)) {
     return body.length
   }
   if (typeof body === 'string') {
     return Buffer.byteLength(body, 'utf8')
   }
-  return 0
+  return Infinity
+}
+
+/**
+ * Wraps a promise so that it rejects if it does not settle within the given timeout.
+ *
+ * @template T
+ * @param {Promise<T>} promise - The promise to wrap.
+ * @param {number} ms - The timeout in milliseconds.
+ *
+ * @returns {Promise<T>} A promise that resolves or rejects with the original promise, or rejects on timeout.
+ */
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('IdempotencyMiddleware - Cache READ Timeout'))
+    }, ms)
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
 }
 
 /**

@@ -178,3 +178,4 @@ dist
 *-lock.json
 bun.lockb
 
+sec-findings.md

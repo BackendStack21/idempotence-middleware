@@ -62,9 +62,13 @@ function createMockReqRes({
   res.end = (body) => {
     res.endCalled = true
     res.endBody = body
-    // Simulate 'end' event after a tick
+    // Simulate 'end' event after a tick, mirroring on-http-end's payload shape.
     process.nextTick(() => {
-      res.emit('end', {status: res.statusCode, data: body})
+      res.emit('end', {
+        status: res.statusCode,
+        headers: res.getHeaders(),
+        data: body,
+      })
     })
   }
 
@@ -929,6 +933,169 @@ test('idempotencyMiddleware - three concurrent requests are deduplicated', async
     assert.strictEqual(response.status, 201)
     assert.strictEqual(response.body, 'created')
   }
+})
+
+test('idempotencyMiddleware - application headers are captured and replayed', async (t) => {
+  const cache = createMockCache()
+  const middleware = idempotencyMiddleware({cache, ttl: 3600})
+
+  const {req, res} = createMockReqRes({headers: {'x-request-id': '123'}})
+  await middleware(req, res, () => {
+    res.setHeader('content-type', 'application/json')
+    res.setHeader('x-custom', 'foo')
+    res.end('Hello')
+  })
+  await new Promise(setImmediate)
+
+  const stored = cache.store.get(buildExpectedKey('123'))
+  assert.strictEqual(stored.headers['content-type'], 'application/json')
+  assert.strictEqual(stored.headers['x-custom'], 'foo')
+
+  const {req: req2, res: res2} = createMockReqRes({
+    headers: {'x-request-id': '123'},
+  })
+  await middleware(req2, res2, () => {})
+  assert.strictEqual(res2.headers['content-type'], 'application/json')
+  assert.strictEqual(res2.headers['x-custom'], 'foo')
+  assert.strictEqual(res2.endBody, 'Hello')
+})
+
+test('idempotencyMiddleware - validates cacheTimeout option', async (t) => {
+  const cache = createMockCache()
+
+  assert.throws(
+    () => idempotencyMiddleware({cache, ttl: 3600, cacheTimeout: 0}),
+    {
+      message: 'IdempotencyMiddleware: cacheTimeout must be a positive number.',
+    },
+  )
+  assert.throws(
+    () => idempotencyMiddleware({cache, ttl: 3600, cacheTimeout: -1}),
+    {
+      message: 'IdempotencyMiddleware: cacheTimeout must be a positive number.',
+    },
+  )
+  assert.throws(
+    () => idempotencyMiddleware({cache, ttl: 3600, cacheTimeout: Infinity}),
+    {
+      message: 'IdempotencyMiddleware: cacheTimeout must be a positive number.',
+    },
+  )
+  assert.throws(
+    () => idempotencyMiddleware({cache, ttl: 3600, cacheTimeout: '1s'}),
+    {
+      message: 'IdempotencyMiddleware: cacheTimeout must be a positive number.',
+    },
+  )
+})
+
+test('idempotencyMiddleware - cache.get timeout releases lock and calls next', async (t) => {
+  const logger = createMockLogger()
+  let getCalls = 0
+  const cache = createMockCache()
+  cache.get = async (key) => {
+    getCalls++
+    if (getCalls === 1) return new Promise(() => {})
+    return null
+  }
+  const middleware = idempotencyMiddleware({
+    cache,
+    ttl: 3600,
+    logger,
+    cacheTimeout: 10,
+  })
+
+  const {req, res} = createMockReqRes({headers: {'x-request-id': '123'}})
+  let nextCalled = false
+  await middleware(req, res, () => {
+    nextCalled = true
+  })
+
+  assert.ok(nextCalled, 'Next should be called when cache.get times out')
+  assert.strictEqual(
+    logger.errorCalls[0][0],
+    'IdempotencyMiddleware - Cache READ Error:',
+  )
+  assert.ok(logger.errorCalls[0][1].message.includes('Cache READ Timeout'))
+
+  // A follow-up request with the same key should be able to acquire a new lock.
+  const {req: req2, res: res2} = createMockReqRes({
+    headers: {'x-request-id': '123'},
+  })
+  let next2Called = false
+  await middleware(req2, res2, () => {
+    next2Called = true
+  })
+  assert.ok(next2Called, 'Lock should be released after timeout')
+})
+
+test('idempotencyMiddleware - unknown body types are not cached when maxResponseSize is set', async (t) => {
+  const cache = createMockCache()
+  const middleware = idempotencyMiddleware({
+    cache,
+    ttl: 3600,
+    maxResponseSize: 1000,
+  })
+
+  const {req, res} = createMockReqRes({headers: {'x-request-id': '123'}})
+  await middleware(req, res, () => {
+    res.end({foo: 'bar'})
+  })
+  await new Promise(setImmediate)
+
+  assert.strictEqual(
+    cache.store.size,
+    0,
+    'Unknown body types should not be cached',
+  )
+})
+
+test('idempotencyMiddleware - replay aborts if response headers already sent', async (t) => {
+  const cache = createMockCache()
+  cache.store.set(buildExpectedKey('123'), {
+    version: 1,
+    status: 200,
+    headers: {},
+    body: {type: 'string', data: 'ok'},
+    cachedAt: Date.now(),
+  })
+  const logger = createMockLogger()
+  const middleware = idempotencyMiddleware({cache, ttl: 3600, logger})
+
+  const {req, res} = createMockReqRes({headers: {'x-request-id': '123'}})
+  res.headersSent = true
+  let nextError
+  await middleware(req, res, (err) => {
+    nextError = err
+  })
+
+  assert.ok(nextError instanceof Error)
+  assert.strictEqual(
+    nextError.message,
+    'IdempotencyMiddleware - Response headers already sent',
+  )
+  assert.strictEqual(res.endCalled, false)
+})
+
+test('idempotencyMiddleware - close event does not leak or double-release lock', async (t) => {
+  const cache = createMockCache()
+  const middleware = idempotencyMiddleware({cache, ttl: 3600})
+
+  const {req, res} = createMockReqRes({headers: {'x-request-id': '123'}})
+  let nextCalled = false
+  await middleware(req, res, () => {
+    nextCalled = true
+  })
+  assert.ok(nextCalled)
+
+  // Simulate a client disconnect before the response finishes.
+  res.emit('close')
+  // Then finish the response as the handler eventually would.
+  res.end('ok')
+  await new Promise(setImmediate)
+
+  const stored = cache.store.get(buildExpectedKey('123'))
+  assert.ok(stored, 'Response should still be cached after close + end')
 })
 
 function buildExpectedKey(idempotencyKey, method = 'POST', url = '/create') {

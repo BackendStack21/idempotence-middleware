@@ -7,7 +7,7 @@ This middleware enables your API to handle requests idempotently, ensuring that 
 - **Idempotent Request Handling**: Ensures that duplicate requests with the same idempotency key are processed only once, preventing unintended side effects.
 - **Original Response Replay**: On a cache hit, the middleware replays the original HTTP status code, headers, and body instead of returning a generic empty response.
 - **Concurrent Request Deduplication**: Uses an in-flight lock so that simultaneous requests with the same idempotency key execute the handler only once.
-- **Cache Key Scoping**: Cache keys are derived from the HTTP method, request URL, and idempotency key to prevent cross-route and cross-method collisions.
+- **Cache Key Scoping**: Cache keys are derived from the HTTP method, full request URL (including query string), and idempotency key to prevent cross-route and cross-method collisions.
 - **Customizable Cache Integration**: Supports any cache library that implements `get` and `set` methods, allowing flexibility in your caching strategy.
 - **Configurable Idempotency Key**: Lets you define the key used to identify requests. By default, it uses the `x-request-id` header.
 - **Adjustable TTL (Time-to-Live)**: Provides the ability to configure the expiration time for cache entries, balancing performance and resource usage (max 24 hours).
@@ -73,14 +73,21 @@ curl -X POST http://localhost:3000/create -H "x-request-id: 123"  # 200 -> Resou
 
 ## Options
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `cache` | `Cache` | required | A cache instance with `.get(key)` and `.set(key, value, {ttl})` methods. |
-| `ttl` | `number` | required | Cache TTL in milliseconds. Must be between `1` and `86,400,000` (24 hours). |
-| `idempotencyKeyExtractor` | `(req) => string \| undefined \| null` | `req.headers['x-request-id']` | Extracts the idempotency key from the request. The returned key must match `^[a-zA-Z0-9_.~-]{1,128}$`. |
-| `keyPrefix` | `string` | `'idemp-key-'` | Prefix prepended to every cache key. |
-| `maxResponseSize` | `number` | `1,048,576` (1 MB) | Maximum response body size (in bytes) that will be cached. Larger responses are not cached. |
-| `logger` | `Logger` | `console` | Logger used for error reporting. Must expose an `.error(...args)` method. |
+| Option                    | Type                                   | Default                       | Description                                                                                                                                                                                                                                            |
+| ------------------------- | -------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `cache`                   | `Cache`                                | required                      | A cache instance with `.get(key)` and `.set(key, value, {ttl})` methods.                                                                                                                                                                               |
+| `ttl`                     | `number`                               | required                      | Cache TTL in milliseconds. Must be between `1` and `86,400,000` (24 hours).                                                                                                                                                                            |
+| `idempotencyKeyExtractor` | `(req) => string \| undefined \| null` | `req.headers['x-request-id']` | Extracts the idempotency key from the request. The returned key must match `^[a-zA-Z0-9_.~-]{1,128}$`. Duplicate headers are exposed as arrays by Node.js; the default extractor does not normalize them, so idempotency is skipped for such requests. |
+| `keyPrefix`               | `string`                               | `'idemp-key-'`                | Prefix prepended to every cache key.                                                                                                                                                                                                                   |
+| `maxResponseSize`         | `number`                               | `1,048,576` (1 MB)            | Maximum response body size (in bytes) that will be cached. Larger responses are not cached.                                                                                                                                                            |
+| `logger`                  | `Logger`                               | `console`                     | Logger used for error reporting. Must expose an `.error(...args)` method.                                                                                                                                                                              |
+
+### Behavior notes
+
+- Only successful responses with a `2xx` status code are cached.
+- Hop-by-hop and connection-level headers such as `Connection`, `Keep-Alive`, `Transfer-Encoding`, `Content-Length`, and `Date` are stripped before replay and are not restored from the cache.
+- Responses larger than `maxResponseSize` are still served to the client; only the cache write is skipped.
+- Previous versions stored a plain string (`"1"`) in the cache. Those entries are ignored after upgrading, so only new responses will be replayed.
 
 ## Customizing idempotency key
 
@@ -95,7 +102,9 @@ function extractIdempotencyKey(req: Request) {
   if (!value || !/^[a-zA-Z0-9_.~-]{1,128}$/.test(value)) {
     return undefined
   }
-  return `${SERVICE_NAME}-${req.user.id}-${value}`
+  // Scope the key with a service and user identifier to prevent cross-user collisions.
+  const userId = req.user?.id ?? 'anonymous'
+  return `${SERVICE_NAME}-${userId}-${value}`
 }
 
 app.use(
